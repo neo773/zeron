@@ -143,9 +143,6 @@ struct CheckoutEntry {
     skipped_while_orphaned: AtomicBool,
     /// Kick channel into the entry's debounce/sync task.
     kick_tx: mpsc::UnboundedSender<()>,
-    /// Destructive mutations are serialized per checkout. File-system
-    /// watchers and read-only captures may still run concurrently.
-    discard_lock: tokio::sync::Mutex<()>,
     /// Keeps the recursive fs watches alive on the shared [`FsWatchHub`];
     /// dropped on entry close. Filled asynchronously — watcher setup (budget
     /// walk + FSEvents registration) can block for seconds, so [`add_entry`]
@@ -196,8 +193,11 @@ struct DiffSyncInner {
     /// Wakes the supervisor to reconcile when an archived chat's interest
     /// starts or lapses.
     interest_changed: Arc<Notify>,
-    /// Serializes discards of checkouts that have no entry (no `discard_lock`).
-    untracked_discard: tokio::sync::Mutex<()>,
+    /// Serializes discards, whether or not their checkout has an entry: an
+    /// entry can appear between the lookup and the lock, and two discards of
+    /// one root must never interleave. File-system watchers and read-only
+    /// captures may still run concurrently.
+    discard_lock: tokio::sync::Mutex<()>,
 }
 
 #[derive(Default)]
@@ -340,7 +340,7 @@ impl CheckoutDiffSync {
                 interest: Mutex::new(HashMap::new()),
                 interest_linger,
                 interest_changed: Arc::new(Notify::new()),
-                untracked_discard: tokio::sync::Mutex::new(()),
+                discard_lock: tokio::sync::Mutex::new(()),
             }),
         };
         let task = tokio::spawn(diff_sync_task(
@@ -493,7 +493,7 @@ impl CheckoutDiffSync {
         let Some(entry) = entry else {
             let root = identity.root.clone();
             return tokio::spawn(async move {
-                let _guard = inner.untracked_discard.lock().await;
+                let _guard = inner.discard_lock.lock().await;
                 discard_working_tree(&inner.repos, &root, &expected_checksum).await
             })
             .await
@@ -504,7 +504,7 @@ impl CheckoutDiffSync {
         // worker stack instead of stacking on the RPC dispatcher's frames
         // (which overflowed the 2 MiB worker stack in debug builds).
         tokio::spawn(async move {
-            let _guard = entry.discard_lock.lock().await;
+            let _guard = inner.discard_lock.lock().await;
             let result =
                 discard_working_tree(&inner.repos, &entry.identity.root, &expected_checksum).await;
 
@@ -755,7 +755,6 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         orphaned_since: Mutex::new(None),
         skipped_while_orphaned: AtomicBool::new(false),
         kick_tx: kick_tx.clone(),
-        discard_lock: tokio::sync::Mutex::new(()),
         watchers: Mutex::new(Vec::new()),
     });
     lock(&inner.entries).insert(entry.identity.id.clone(), entry.clone());

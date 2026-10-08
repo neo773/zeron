@@ -866,6 +866,31 @@ fn is_text_append(frame: &TranscriptFrame) -> bool {
         if upsert.is_empty() && remove.is_empty() && !append.is_empty())
 }
 
+/// Each session's indicator at `now` (the lease-dependent part of a frame).
+fn session_presence_at(sessions: &[Session], now: DateTime<Utc>) -> Vec<Indicator> {
+    sessions
+        .iter()
+        .map(|session| effective_indicator(Some(session), now))
+        .collect()
+}
+
+/// Device rows as rendered at `now`: the heartbeat timestamp only through its
+/// online state and last-seen label.
+fn device_presentation_at(devices: &[Device], now: DateTime<Utc>) -> Vec<(Device, bool, String)> {
+    devices
+        .iter()
+        .map(|device| {
+            let mut metadata = device.clone();
+            metadata.last_seen_at = None;
+            (
+                metadata,
+                crate::settings::devices::device_online(device.last_seen_at, now),
+                crate::settings::devices::format_last_seen(device.last_seen_at, now),
+            )
+        })
+        .collect()
+}
+
 impl Default for AppState {
     fn default() -> Self {
         Self::new()
@@ -1148,10 +1173,7 @@ impl AppState {
     }
 
     fn apply_sessions_at(&mut self, sessions: Vec<Session>, now: DateTime<Utc>) -> bool {
-        let presence: Vec<_> = sessions
-            .iter()
-            .map(|session| effective_indicator(Some(session), now))
-            .collect();
+        let presence = session_presence_at(&sessions, now);
         let presentation: Vec<_> = sessions
             .iter()
             .map(|session| {
@@ -1380,23 +1402,8 @@ impl AppState {
             self.change_requests
                 .clear_unsupported_on_version_change(&device.id, device.version.as_deref());
         }
-        let presentation: Vec<_> = devices
-            .iter()
-            .map(|device| {
-                let mut metadata = device.clone();
-                metadata.last_seen_at = None;
-                (
-                    metadata,
-                    crate::settings::devices::device_online(device.last_seen_at, now),
-                    crate::settings::devices::format_last_seen(device.last_seen_at, now),
-                )
-            })
-            .collect();
-        let session_presence: Vec<_> = self
-            .sessions
-            .iter()
-            .map(|session| effective_indicator(Some(session), now))
-            .collect();
+        let presentation = device_presentation_at(&devices, now);
+        let session_presence = session_presence_at(&self.sessions, now);
         let changed = self.device_presentation.as_ref() != Some(&presentation)
             || self.session_presence_presentation != session_presence;
         self.device_presentation = Some(presentation);
@@ -2195,6 +2202,14 @@ impl AppState {
         self.arm_clock_transition(cx);
     }
 
+    /// Re-evaluate the clock-dependent parts of the change-detection caches.
+    fn refresh_clock_presentations(&mut self, now: DateTime<Utc>) {
+        self.session_presence_presentation = session_presence_at(&self.sessions, now);
+        if self.device_presentation.is_some() {
+            self.device_presentation = Some(device_presentation_at(&self.devices, now));
+        }
+    }
+
     fn arm_clock_transition(&mut self, cx: &mut Context<Self>) {
         let now = clock_now();
         self.clock.checked_at = Some(now);
@@ -2213,6 +2228,10 @@ impl AppState {
                     let now = clock_now();
                     let from = state.clock.checked_at.unwrap_or(now);
                     if state.clock_transition_between(from, now) {
+                        // Record what this transition changed, so the frame
+                        // that later reverts it (a heartbeat reviving the
+                        // session or device) compares unequal and notifies.
+                        state.refresh_clock_presentations(now);
                         // The self-observer re-arms for the next deadline.
                         cx.notify();
                     } else {
@@ -2330,6 +2349,7 @@ impl AppState {
             state.attach_engine(engine, cx);
         }
         state.select_chat(Some(chat.id), cx);
+        state.watch_clock_transitions(cx);
         state
     }
 
@@ -5020,6 +5040,35 @@ mod tests {
         assert_eq!(notifies.get(), 0);
         advance_to(cx, &clock, cutoff - TimeDelta::milliseconds(1), cutoff);
         assert_eq!(notifies.get(), 1);
+    }
+
+    #[gpui::test]
+    fn revival_after_a_clock_transition_notifies_and_rearms(cx: &mut gpui::TestAppContext) {
+        let now = clock_epoch();
+        let clock = TestClock::start(now);
+        let row = session("row", SessionStatus::Working, 0, now);
+        let stale_at = now + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        let (state, notifies, _subscription) = clock_state(cx, |state| {
+            state.apply_sessions_at(vec![row], now);
+        });
+        advance_to(cx, &clock, now, stale_at);
+        assert_eq!(notifies.get(), 1, "went stale by clock alone");
+        // A heartbeat revives it: that is a visible change again, and the
+        // revived lease arms its own cutoff.
+        let revived = stale_at + TimeDelta::seconds(1);
+        advance_to(cx, &clock, stale_at, revived);
+        state.update(cx, |state, cx| {
+            let changed = state.apply_sessions_at(
+                vec![session("row", SessionStatus::Working, 0, revived)],
+                revived,
+            );
+            assert!(changed, "revival is a change");
+            cx.notify();
+        });
+        assert_eq!(notifies.get(), 2);
+        let next_cutoff = revived + TimeDelta::milliseconds(SESSION_STALE_MS + 1);
+        advance_to(cx, &clock, revived, next_cutoff);
+        assert_eq!(notifies.get(), 3, "the revived lease's cutoff fires");
     }
 
     #[test]

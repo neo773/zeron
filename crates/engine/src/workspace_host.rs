@@ -71,10 +71,6 @@ const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
 const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
-/// Snapshot shrink at boot (a one-time registry compaction) that warrants a
-/// second store reclaim pass; the store still applies its own VACUUM
-/// thresholds, so this only avoids pointless checkpoints on ordinary boots.
-const RECLAIM_AFTER_SHRINK_BYTES: usize = 8 * 1024 * 1024;
 
 /// Initial-join retry backoff (base, cap). A first registry-room join that
 /// fails must not strand the device offline until an app restart — retry until
@@ -155,6 +151,12 @@ pub struct WorkspaceHostConfig {
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
+    /// The profile can never attach an edge (`WorkspaceScope::Local`), so
+    /// registry writes fold straight into the local rows instead of queueing
+    /// for acks that will never come. Only then: a replica that may attach
+    /// later must keep its writes as ops — re-seeding folded rows as full
+    /// upserts would revive rows another device deleted meanwhile.
+    pub local_only: bool,
 }
 
 struct WorkspaceHostInner {
@@ -205,7 +207,6 @@ impl WorkspaceHost {
     /// the change-driven task, and join the edge registry room when configured.
     pub fn open(store: Arc<DocsStore>, config: WorkspaceHostConfig) -> Result<Self, EngineError> {
         let stored = store.load_snapshot(REGISTRY_DOC_ID)?;
-        let loaded_len = stored.as_ref().map(Vec::len);
         let mut doc = match stored {
             Some(bytes) => RegistryDoc::from_bytes(&bytes, &config.device_id)
                 .map_err(|e| EngineError::Other(format!("registry snapshot load failed: {e}")))?,
@@ -253,12 +254,12 @@ impl WorkspaceHost {
                 doc
             }
         };
-        // Without an edge nothing will ever ack a pending batch: fold the
+        // A Local profile never has an edge to ack a pending batch: fold the
         // queue (a pre-fix snapshot's 178k never-acked batches, or this
         // boot's migration seeds) into the local rows and keep folding every
-        // write. With an edge this re-seeds once if local-only writes exist
-        // that no server has seen. The boot save below persists the result.
-        doc.set_local_only(config.edge.is_none());
+        // write. Otherwise this re-seeds once if local-only writes exist that
+        // no server has seen. The boot save below persists the result.
+        doc.set_local_only(config.local_only);
         // Destructive-break hygiene: the pre-spaces row stays unreachable.
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
@@ -329,21 +330,14 @@ impl WorkspaceHost {
         // Persist immediately: after this boot the migration source is never
         // read again, so the registry snapshot must exist even if the process
         // dies before the first debounced save.
-        match host.inner.persist_snapshot() {
-            Ok(saved_len) => {
-                // A one-time compaction just freed the old blob's pages, but
-                // the store's open-time VACUUM already ran (before it). Reclaim
-                // now instead of on the next launch — off the boot path, and
-                // best-effort (the store gates it on its own thresholds).
-                if loaded_len
-                    .is_some_and(|len| len.saturating_sub(saved_len) >= RECLAIM_AFTER_SHRINK_BYTES)
-                {
-                    let store = host.inner.store.clone();
-                    tokio::task::spawn_blocking(move || store.reclaim_free_space());
-                }
-            }
-            Err(error) => tracing::warn!(%error, "registry snapshot save failed"),
+        if let Err(error) = host.inner.persist_snapshot() {
+            tracing::warn!(%error, "registry snapshot save failed");
         }
+        // Reclaim free pages (a bloated store, or the pages a one-time
+        // registry compaction just freed) off the boot path. The store gates
+        // the VACUUM on its own thresholds, so ordinary boots only checkpoint.
+        let store = host.inner.store.clone();
+        tokio::task::spawn_blocking(move || store.reclaim_free_space());
         host.join_room();
         tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
         if host.inner.config.edge.is_some() {
@@ -1765,6 +1759,7 @@ mod tests {
                 org_id: "test-org".into(),
                 user_id: "test-user".into(),
                 edge: None,
+                local_only: false,
             },
         )
         .unwrap();
@@ -1821,6 +1816,7 @@ mod tests {
                 org_id: "test-org".into(),
                 user_id: "test-user".into(),
                 edge: None,
+                local_only: false,
             },
         )
         .unwrap();
@@ -1927,6 +1923,7 @@ mod tests {
                 org_id: "test-org".into(),
                 user_id: "test-user".into(),
                 edge: None,
+                local_only: true,
             },
         )
         .unwrap();
@@ -1966,6 +1963,7 @@ mod tests {
                 user_id: "test-user".into(),
                 // Unreachable edge: writes queue (and retry) without acks.
                 edge: Some(EdgeConfig::with_static_token("http://127.0.0.1:1", "test")),
+                local_only: false,
             },
         )
         .unwrap();
@@ -2032,6 +2030,7 @@ mod tests {
                 org_id: "test-org".into(),
                 user_id: "test-user".into(),
                 edge: None,
+                local_only: true,
             },
         )
         .unwrap();

@@ -6,7 +6,8 @@
 //! per space folder put ~25-30 idle threads on a normal device at boot. The hub
 //! instead installs every path on a single watcher and routes each event to
 //! the registrations whose path covers it, so the whole engine pays for one
-//! watcher thread.
+//! watcher thread. Exception: inotify/kqueue get one watcher per installed
+//! root (see [`SHARED_WATCHER`]); they still share the routing and batching.
 //!
 //! Semantics match a private watcher per registration:
 //!
@@ -39,9 +40,10 @@
 //!
 //! OS watches are the minimal cover of the registrations: identical paths are
 //! installed once (recursive if any registration wants recursion) and a path
-//! under a recursively watched ancestor is not installed separately. That is
-//! not just economy — on inotify two overlapping watches in one instance share
-//! watch descriptors, and unwatching either one would silently strip the other.
+//! under a recursively watched ancestor is not installed separately. When the
+//! covering watch of a live registration is replaced (a nested path takes over
+//! from a dropped recursive ancestor, a mode change), the registration gets a
+//! rescan: the swap itself was unobserved.
 //!
 //! Watch failures (the folder vanished, inotify limits) are logged and the
 //! registration stays without a live watch, exactly like a private watcher
@@ -61,6 +63,13 @@ const BATCH_QUIET: Duration = Duration::from_millis(100);
 const BATCH_MAX: Duration = Duration::from_secs(1);
 /// Whether a watch change restarts the stream for every path (FSEvents).
 const STREAM_RESTARTS_ON_CHANGE: bool = cfg!(target_os = "macos");
+/// Whether every root can share one watcher. inotify (and kqueue) build a
+/// recursive watch by walking the tree *following symlinks*, so in a shared
+/// instance a checkout that symlinks into another checkout (`npm link`) would
+/// alias that checkout's watch descriptors: its events would be relabelled
+/// and unwatching either root would strip the other. Those backends get one
+/// watcher per installed root instead, exactly as before the hub.
+const SHARED_WATCHER: bool = cfg!(any(target_os = "macos", windows));
 
 type Handler = Arc<dyn Fn(&notify::Event) + Send + Sync>;
 
@@ -97,10 +106,15 @@ struct Routes {
 
 #[derive(Default)]
 struct OsState {
-    /// Created lazily on the first install. On macOS an FSEvents watcher with
-    /// no paths has no run-loop thread at all.
+    /// The shared watcher ([`SHARED_WATCHER`] backends). Created lazily on the
+    /// first install. On macOS an FSEvents watcher with no paths has no
+    /// run-loop thread at all.
     watcher: Option<notify::RecommendedWatcher>,
-    /// Canonical path → recursive, as installed on `watcher`.
+    /// One watcher per installed root on the other backends. Dropping one
+    /// closes its instance, releasing every OS watch it added — including
+    /// those a failed recursive `watch` left behind.
+    roots: HashMap<PathBuf, notify::RecommendedWatcher>,
+    /// Canonical path → recursive, as installed.
     installed: HashMap<PathBuf, bool>,
     /// Wanted paths whose watch failed. Not retried while still wanted (every
     /// FSEvents watch/unwatch restarts the stream for *all* paths); forgotten
@@ -133,6 +147,8 @@ pub(crate) struct FsWatchHub {
     os: Mutex<OsState>,
     batch: Mutex<Batch>,
     restarts_on_change: bool,
+    /// [`SHARED_WATCHER`]; a field so tests can drive both modes.
+    shared_watcher: bool,
     bridge_enabled: AtomicBool,
     #[cfg_attr(not(test), allow(dead_code))]
     stats: Stats,
@@ -161,13 +177,15 @@ impl Drop for FsWatch {
     }
 }
 
-/// Resets [`Batch::worker`] even if a pass panics, so later changes still
-/// get a worker.
+/// Resets [`Batch::worker`] if a pass panics, so later changes still get a
+/// worker. A normal exit resets it in [`FsWatchHub::run_batches`] itself.
 struct WorkerGuard<'a>(&'a FsWatchHub);
 
 impl Drop for WorkerGuard<'_> {
     fn drop(&mut self) {
-        lock(&self.0.batch).worker = false;
+        if std::thread::panicking() {
+            lock(&self.0.batch).worker = false;
+        }
     }
 }
 
@@ -178,6 +196,7 @@ impl FsWatchHub {
             os: Mutex::new(OsState::default()),
             batch: Mutex::new(Batch::default()),
             restarts_on_change: STREAM_RESTARTS_ON_CHANGE,
+            shared_watcher: SHARED_WATCHER,
             bridge_enabled: AtomicBool::new(true),
             stats: Stats::default(),
         })
@@ -263,8 +282,12 @@ impl FsWatchHub {
                 }
             }
             self.apply();
-            // Changes that landed during the pass need another one.
-            if lock(&self.batch).generation == seen {
+            // Changes that landed during the pass need another one. Release
+            // `worker` under the same lock as the check: a `schedule` between
+            // the two would see a worker that is about to exit and be lost.
+            let mut batch = lock(&self.batch);
+            if batch.generation == seen {
+                batch.worker = false;
                 return;
             }
         }
@@ -305,9 +328,8 @@ impl FsWatchHub {
                 bridge_tried = true;
                 bridge = self.open_bridge(&os.installed, &desired);
             }
-            // Removals before additions: on inotify, installing a path that an
-            // outgoing recursive watch still covers would merge into its watch
-            // descriptors, and the later removal would take them with it.
+            // Removals before additions, so an outgoing watch never overlaps an
+            // incoming one on the same watcher.
             let stale: Vec<PathBuf> = os
                 .installed
                 .iter()
@@ -316,7 +338,9 @@ impl FsWatchHub {
                 .collect();
             for path in stale {
                 os.installed.remove(&path);
-                if let Some(watcher) = os.watcher.as_mut() {
+                if os.roots.remove(&path).is_some() {
+                    touched = true;
+                } else if let Some(watcher) = os.watcher.as_mut() {
                     touched = true;
                     if let Err(err) = watcher.unwatch(&path) {
                         tracing::debug!(path = %path.display(), error = %err, "fs-watch: unwatch failed");
@@ -328,7 +352,14 @@ impl FsWatchHub {
                 if os.installed.get(&path) == Some(&recursive) {
                     continue;
                 }
-                match install(os, &self.routes, &path, recursive, &mut touched) {
+                match install(
+                    os,
+                    &self.routes,
+                    self.shared_watcher,
+                    &path,
+                    recursive,
+                    &mut touched,
+                ) {
                     Ok(()) => {
                         os.installed.insert(path, recursive);
                     }
@@ -361,7 +392,12 @@ impl FsWatchHub {
             let was_attached = reg.attached.swap(true, Ordering::AcqRel);
             // New: everything before the watch went live was unobserved.
             // Gap: events may have been dropped while the stream restarted.
-            if !was_attached || (gap && is_covered(&reg.path, &before)) {
+            // Moved: the OS watch covering it was replaced (a recursive root
+            // dropped for a nested one, a mode change) — the bridge only spans
+            // unchanged roots, so the swap itself was unobserved.
+            let moved =
+                covering_roots(&reg.path, &before) != covering_roots(&reg.path, &os.installed);
+            if !was_attached || moved || (gap && is_covered(&reg.path, &before)) {
                 rescans.push(reg.handler.clone());
             }
         }
@@ -420,6 +456,7 @@ impl FsWatchHub {
 fn install(
     os: &mut OsState,
     routes: &Arc<Mutex<Routes>>,
+    shared: bool,
     path: &Path,
     recursive: bool,
     touched: &mut bool,
@@ -429,20 +466,29 @@ fn install(
     if !path.exists() {
         return Err(notify::Error::path_not_found().add_path(path.to_path_buf()));
     }
-    if os.watcher.is_none() {
+    let new_watcher = || {
         let routes = routes.clone();
-        let watcher =
-            notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
-                Ok(event) => dispatch(&routes, &event),
-                Err(err) => tracing::debug!(error = %err, "fs-watch: watcher error"),
-            })?;
-        os.watcher = Some(watcher);
-    }
+        notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
+            Ok(event) => dispatch(&routes, &event),
+            Err(err) => tracing::debug!(error = %err, "fs-watch: watcher error"),
+        })
+    };
     let mode = if recursive {
         notify::RecursiveMode::Recursive
     } else {
         notify::RecursiveMode::NonRecursive
     };
+    if !shared {
+        // On failure the watcher drops here, with any partial watches.
+        let mut watcher = new_watcher()?;
+        *touched = true;
+        watcher.watch(path, mode)?;
+        os.roots.insert(path.to_path_buf(), watcher);
+        return Ok(());
+    }
+    if os.watcher.is_none() {
+        os.watcher = Some(new_watcher()?);
+    }
     *touched = true;
     os.watcher
         .as_mut()
@@ -450,10 +496,25 @@ fn install(
         .watch(path, mode)
 }
 
+fn root_covers(root: &Path, recursive: bool, path: &Path) -> bool {
+    path == root || (recursive && path.starts_with(root))
+}
+
 fn is_covered(path: &Path, installed: &HashMap<PathBuf, bool>) -> bool {
     installed
         .iter()
-        .any(|(root, recursive)| path == root || (*recursive && path.starts_with(root)))
+        .any(|(root, recursive)| root_covers(root, *recursive, path))
+}
+
+fn covering_roots<'a>(
+    path: &Path,
+    installed: &'a HashMap<PathBuf, bool>,
+) -> std::collections::BTreeSet<(&'a PathBuf, bool)> {
+    installed
+        .iter()
+        .filter(|(root, recursive)| root_covers(root, **recursive, path))
+        .map(|(root, recursive)| (root, *recursive))
+        .collect()
 }
 
 fn common_ancestor(paths: &[&PathBuf]) -> Option<PathBuf> {
@@ -833,5 +894,71 @@ mod tests {
         drop(nested);
         hub.apply();
         assert!(hub.installed().is_empty());
+    }
+
+    /// A hub configured like inotify's: a watcher per root, no restarts.
+    fn per_root_hub() -> Arc<FsWatchHub> {
+        let hub = Arc::into_inner(FsWatchHub::new()).expect("fresh hub");
+        Arc::new(FsWatchHub {
+            shared_watcher: false,
+            restarts_on_change: false,
+            ..hub
+        })
+    }
+
+    #[test]
+    fn replaced_cover_rescans_the_registration() {
+        let (_tmp, root) = tree();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        for hub in [FsWatchHub::new(), per_root_hub()] {
+            let (on_nested, mut nested_rx) = recorder();
+            let _nested = hub.watch(
+                &root.join("nested"),
+                notify::RecursiveMode::Recursive,
+                on_nested,
+            );
+            let deep = hub.watch(&root, notify::RecursiveMode::Recursive, |_| {});
+            hub.apply();
+            drain(&mut nested_rx);
+            // `nested` rode inside `root`'s watch; it now gets its own, and
+            // nothing observed the swap.
+            drop(deep);
+            hub.apply();
+            assert_eq!(
+                hub.installed(),
+                HashMap::from([(root.join("nested"), true)])
+            );
+            assert!(drain(&mut nested_rx).contains(&Seen::Rescan));
+            // A pass that leaves its cover alone sends nothing.
+            let _other = hub.watch(&root, notify::RecursiveMode::NonRecursive, |_| {});
+            hub.apply();
+            assert!(!drain(&mut nested_rx).contains(&Seen::Rescan));
+        }
+    }
+
+    #[tokio::test]
+    async fn per_root_watchers_route_events_and_close_on_drop() {
+        let (_tmp, root) = tree();
+        let (a, b) = (root.join("a"), root.join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        let hub = per_root_hub();
+        let (on_a, mut a_rx) = recorder();
+        let watch_a = hub.watch(&a, notify::RecursiveMode::Recursive, on_a);
+        let (on_b, mut b_rx) = recorder();
+        let _watch_b = hub.watch(&b, notify::RecursiveMode::Recursive, on_b);
+        hub.apply();
+        assert_eq!(lock(&hub.os).roots.len(), 2);
+        assert!(lock(&hub.os).watcher.is_none());
+        settle(&hub).await;
+        drain(&mut a_rx);
+        drain(&mut b_rx);
+        std::fs::write(b.join("x"), "x").unwrap();
+        expect(&mut b_rx, Seen::Event).await;
+        assert!(!drain(&mut a_rx).contains(&Seen::Event));
+        drop(watch_a);
+        hub.apply();
+        assert_eq!(lock(&hub.os).roots.keys().collect::<Vec<_>>(), [&b]);
     }
 }

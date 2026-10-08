@@ -86,14 +86,14 @@ const STORE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// bursts a truncate/re-extend cycle on every write.
 const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
-/// Boot-time VACUUM only when free pages are BOTH a large share of the file
+/// VACUUM ([`DocsStore::reclaim_free_space`]) only when free pages are BOTH a large share of the file
 /// and a meaningful absolute size: a healthy database never pays the rewrite.
 const VACUUM_MIN_FREE_BYTES: i64 = 32 * 1024 * 1024;
 /// `freelist_count / page_count` above which reclaiming is worth a rewrite.
 const VACUUM_MIN_FREE_DENOMINATOR: i64 = 4;
 
-/// Maintenance at open is skipped (and logged) rather than waited on when
-/// another connection holds a lock.
+/// Maintenance is skipped (and logged) rather than waited on when another
+/// connection holds a lock.
 const MAINTENANCE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -122,7 +122,10 @@ impl DocsStore {
         migrate(&mut conn)?;
         // Best-effort hygiene must never stall boot behind another connection.
         conn.busy_timeout(MAINTENANCE_BUSY_TIMEOUT)?;
-        maintain_on_open(&conn, &path);
+        // Only the cheap WAL truncate here: open sits on boot paths (engine
+        // assembly, the iOS client), and a VACUUM's cost is linear in the
+        // live size. Callers run `reclaim_free_space` off those paths.
+        checkpoint_truncate(&conn, &path, "open");
         conn.busy_timeout(STORE_BUSY_TIMEOUT)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -588,14 +591,11 @@ impl DocsStore {
         Ok(())
     }
 
-    /// Reclaim space after a caller shrank stored data a lot (the registry
-    /// snapshot's one-time compaction): the open-time hygiene again — WAL
-    /// truncate, then a VACUUM only past the same free-page thresholds,
-    /// under the same short busy timeout. The open-time pass runs BEFORE
-    /// such a shrink, so without this the freed pages wait a launch.
-    /// Blocking (a VACUUM rewrites the live database; run it off any
-    /// latency-sensitive path); best-effort — problems are logged, never
-    /// returned.
+    /// Reclaim free space: WAL truncate, then a VACUUM only past the
+    /// free-page thresholds, under a short busy timeout. Cheap when there is
+    /// nothing to reclaim. Blocking and holds the store for the VACUUM (it
+    /// rewrites the live database) — run it off any latency-sensitive path;
+    /// best-effort — problems are logged, never returned.
     pub fn reclaim_free_space(&self) {
         store_blocking(|| {
             let conn = self.conn();
@@ -606,7 +606,7 @@ impl DocsStore {
                 tracing::warn!(%err, "docs store: reclaim skipped");
                 return;
             }
-            maintain_on_open(&conn, &path);
+            maintain(&conn, &path);
             if let Err(err) = conn.busy_timeout(STORE_BUSY_TIMEOUT) {
                 tracing::warn!(%err, "docs store: busy timeout not restored after reclaim");
             }
@@ -648,12 +648,12 @@ fn migrate(conn: &mut Connection) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Boot hygiene: fold and truncate a WAL left bloated by a previous run, then
-/// reclaim free pages if they dominate the file. Every step is best-effort —
-/// failures (including SQLITE_BUSY from another connection) are logged and
-/// the open proceeds. Steady-state WAL growth is handled by SQLite's
-/// auto-checkpoint plus `journal_size_limit`, so there is no periodic pass.
-fn maintain_on_open(conn: &Connection, path: &Path) {
+/// Fold and truncate a bloated WAL, then reclaim free pages if they dominate
+/// the file. Every step is best-effort — failures (including SQLITE_BUSY from
+/// another connection) are logged. Steady-state WAL growth is handled by
+/// SQLite's auto-checkpoint plus `journal_size_limit`, so there is no
+/// periodic pass.
+fn maintain(conn: &Connection, path: &Path) {
     checkpoint_truncate(conn, path, "open");
     match reclaim_free_pages(conn) {
         // VACUUM in WAL mode writes the whole live database into the WAL.
@@ -1036,13 +1036,16 @@ mod maintenance_tests {
     }
 
     #[test]
-    fn open_vacuums_a_fragmented_database_once() {
+    fn reclaim_vacuums_a_fragmented_database_once() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("docs.sqlite3");
         fragmented_store(dir.path());
         let before = file_len(&db);
 
         let store = DocsStore::open(dir.path()).unwrap();
+        // Open never pays for the rewrite; the reclaim pass does.
+        assert!(pragma(&store.conn(), "freelist_count") > 0);
+        store.reclaim_free_space();
         assert_eq!(pragma(&store.conn(), "freelist_count"), 0);
         assert!(file_len(&db) < before / 2, "file shrank");
         assert_eq!(file_len(&dir.path().join("docs.sqlite3-wal")), 0);
@@ -1120,6 +1123,7 @@ mod maintenance_tests {
 
             let started = Instant::now();
             let store = DocsStore::open(dir.path()).expect("maintenance never fails open");
+            store.reclaim_free_space();
             assert!(
                 started.elapsed() < Duration::from_secs(3),
                 "{lock}: maintenance waited on the store busy timeout"
@@ -1135,8 +1139,9 @@ mod maintenance_tests {
             store.save_snapshot("after", b"ok").unwrap();
             assert!(store.has_snapshot("after").unwrap());
             drop(store);
-            // A deferred VACUUM simply runs on the next uncontended boot.
+            // A deferred VACUUM simply runs on the next uncontended pass.
             let store = DocsStore::open(dir.path()).unwrap();
+            store.reclaim_free_space();
             assert_eq!(pragma(&store.conn(), "freelist_count"), 0, "{lock}");
         }
     }
