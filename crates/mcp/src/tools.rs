@@ -680,6 +680,8 @@ impl Tools {
                 Some(key) => Some(self.zeron.resolve_chat(key).await?.id),
                 None => self.zeron.origin().chat_id.clone(),
             }
+            // A hidden voice orchestrator creates top-level sessions.
+            .filter(|parent| !zeron_proto::voice::is_orchestrator_chat(parent))
         };
         anyhow::ensure!(
             args.kind != Some(ChatKind::Side) || parent_chat_id.is_some(),
@@ -763,7 +765,30 @@ impl Tools {
         {
             mutate["branch"] = json!(branch);
         }
-        if let Some(cwd) = args.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let mut cwd = args
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|c| !c.is_empty())
+            .map(str::to_owned);
+        // A projectless chat runs in its own scratch folder on a host that
+        // creates them; naming it here keeps createChat and the first run
+        // in agreement.
+        if space.is_none()
+            && cwd.is_none()
+            && self.zeron.devices().await?.iter().any(|d| {
+                d.id == device_id
+                    && d.capabilities
+                        .iter()
+                        .any(|c| c == zeron_proto::capabilities::PROJECTLESS_SCRATCH_V1)
+            })
+        {
+            cwd = Some(zeron_proto::projectless::scratch_cwd(
+                &chat_id,
+                chrono::Utc::now(),
+            ));
+        }
+        if let Some(cwd) = &cwd {
             mutate["cwd"] = json!(cwd);
         }
         self.zeron.mutate(mutate).await?;
@@ -797,7 +822,7 @@ impl Tools {
                 device_id: device_id.clone(),
                 title: args.title.clone(),
                 archived: false,
-                cwd: args.cwd.clone(),
+                cwd: cwd.clone(),
                 branch: args.branch.clone(),
                 checkout_id: None,
                 source_context: None,
@@ -1007,7 +1032,8 @@ impl Tools {
 
     /// Prefix the sender's identity when this server speaks for a chat, so
     /// the receiving agent (and the human reading that transcript) can tell
-    /// an agent-to-agent message from a typed one.
+    /// an agent-to-agent message from a typed one. Reply instructions always
+    /// use the full id: display prefixes need not uniquely identify a chat.
     async fn attribute(&self, target: &Chat, text: &str) -> String {
         let Some(origin_id) = self.zeron.origin().chat_id.as_deref() else {
             return text.to_owned();
@@ -1027,7 +1053,7 @@ impl Tools {
         };
         format!(
             "[Message from Zeron chat {label}. Reply to it with the Zeron `send_message` tool, chat {}.]\n\n{text}",
-            short(origin_id)
+            origin_id
         )
     }
 
@@ -1248,6 +1274,7 @@ mod tests {
         dispatch_barrier: Option<tokio::sync::Barrier>,
         beta_parent: Option<String>,
         beta_remote: bool,
+        extra_chats: Vec<Value>,
         catalog_error: Option<&'static str>,
         reads: Mutex<Vec<(String, Value)>>,
     }
@@ -1288,7 +1315,8 @@ mod tests {
                     "id": "space-unique", "deviceId": "dev-remote", "path": "/repo/unique",
                     "gitDetected": true, "createdAt": "2026-09-01T00:00:00Z"
                 }])),
-                methods::WATCH_CHATS => stream(json!([
+                methods::WATCH_CHATS => {
+                    let mut chats = json!([
                     {
                         "id": "chat-alpha-1", "deviceId": "dev-local", "title": "Alpha",
                         "archived": false, "spaceId": "space-1",
@@ -1301,7 +1329,13 @@ mod tests {
                         "archived": false, "spaceId": "space-1",
                         "createdAt": "2026-09-02T00:00:00Z"
                     }
-                ])),
+                    ]);
+                    chats
+                        .as_array_mut()
+                        .unwrap()
+                        .extend(self.extra_chats.clone());
+                    stream(chats)
+                }
                 methods::WATCH_SESSIONS => stream(json!([])),
                 methods::LIST_HARNESSES if remote => RpcReply::Value(json!([
                     {"id":"codex", "name":"Remote Codex", "installed":true},
@@ -1425,9 +1459,83 @@ mod tests {
             "{prompt}"
         );
         assert!(prompt.ends_with("please review"));
+        assert!(prompt.contains("tool, chat chat-beta-2.]"), "{prompt}");
         assert_eq!(params["command"]["request"]["cwd"], "/repo/comet");
         assert_eq!(params["command"]["request"]["harness"], "claude-code");
         assert_eq!(params["command"]["request"]["model"], "opus");
+    }
+
+    #[tokio::test]
+    async fn replies_use_the_full_id_with_multiple_voice_orchestrators() {
+        let first = "voice-orchestrator-11111111-1111-4111-8111-111111111111";
+        let second = "voice-orchestrator-22222222-2222-4222-8222-222222222222";
+        let world = Arc::new(World {
+            extra_chats: [first, second]
+                .into_iter()
+                .map(|id| {
+                    json!({
+                        "id": id, "deviceId": "dev-local", "title": "Voice session",
+                        "archived": false, "createdAt": "2026-10-01T00:00:00Z"
+                    })
+                })
+                .collect(),
+            ..Default::default()
+        });
+        let orchestrator = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some(second.into()),
+                device_id: None,
+            },
+        );
+        let error = orchestrator
+            .zeron
+            .resolve_chat("voice-or")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("2 chats start with"), "{error}");
+        orchestrator
+            .call(
+                "send_message",
+                json!({
+                    "chat": "alpha", "text": "please review"
+                }),
+            )
+            .await
+            .unwrap();
+        let reply_id = {
+            let writes = world.writes.lock().unwrap();
+            let prompt = writes.last().unwrap().1["command"]["request"]["prompt"]
+                .as_str()
+                .unwrap();
+            prompt
+                .split_once("tool, chat ")
+                .unwrap()
+                .1
+                .split_once(".]\n\n")
+                .unwrap()
+                .0
+                .to_owned()
+        };
+        assert_eq!(reply_id, second);
+        let worker = tools(
+            world.clone(),
+            Origin {
+                chat_id: Some("chat-alpha-1".into()),
+                device_id: None,
+            },
+        );
+        worker
+            .call(
+                "send_message",
+                json!({
+                    "chat": reply_id, "text": "review complete"
+                }),
+            )
+            .await
+            .unwrap();
+        let writes = world.writes.lock().unwrap();
+        assert_eq!(writes.last().unwrap().1["chatId"], second);
     }
 
     #[tokio::test]
@@ -1442,6 +1550,7 @@ mod tests {
             started_at: None,
             updated_at: chrono::Utc::now() - chrono::Duration::minutes(10),
             last_completed_turn: None,
+            running_subagents: 0,
         };
         // No mid-turn capability is required for a live mailbox delivery.
         let sent = tools
@@ -2158,6 +2267,60 @@ mod tests {
             .unwrap();
         assert_eq!(result["turn"]["outcome"], "timedOut");
         assert_eq!(result["turn"]["replies"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn remote_replies_do_not_require_synchronized_clocks() {
+        for host_skew_millis in [-1_000, 1_000] {
+            for wait in [true, false] {
+                let service = Arc::new(DelayedTurn {
+                    world: World {
+                        beta_remote: true,
+                        ..Default::default()
+                    },
+                    sent: Mutex::new(None),
+                    reply_delay: Duration::from_millis(450),
+                    never_reply: false,
+                    host_skew_millis,
+                });
+                let tools = Tools::new(Arc::new(Zeron::with_client(
+                    memory_client(service),
+                    Origin::default(),
+                )));
+                let sent = tools
+                    .call(
+                        "send_message",
+                        json!({
+                            "chat":"Beta", "text":"go", "wait":wait, "timeout_secs":2
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                let result = if wait {
+                    sent
+                } else {
+                    tools
+                        .call(
+                            "wait_for_turn",
+                            json!({
+                                "chat":sent["chatId"], "timeout_secs":2
+                            }),
+                        )
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(
+                    result["turn"]["outcome"], "completed",
+                    "offset={host_skew_millis}, wait={wait}: {result}"
+                );
+                assert_eq!(
+                    result["turn"]["replies"].as_array().unwrap().len(),
+                    1,
+                    "{result}"
+                );
+                assert_eq!(result["turn"]["replies"][0]["id"], "new-reply");
+            }
+        }
     }
 
     #[tokio::test]
